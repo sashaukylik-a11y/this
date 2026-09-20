@@ -218,3 +218,224 @@ extern "C" void* memmove(void* d,const void* s,SIZE_T n){ BYTE* a=(BYTE*)d; cons
 #define PROCESS_QUERY_INFORMATION 0x0400
 #define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
 #define GENERIC_READ 0x80000000UL
+
+#define GENERIC_WRITE 0x40000000UL
+#define FILE_SHARE_READ 0x00000001
+#define OPEN_EXISTING 3
+#define CREATE_ALWAYS 2
+#define FILE_ATTRIBUTE_NORMAL 0x80
+#define WS_POPUP 0x80000000UL
+#define WS_EX_TOOLWINDOW 0x00000080UL
+#define WS_EX_TOPMOST 0x00000008UL
+#define WS_EX_LAYERED 0x00080000UL
+#define WS_EX_TRANSPARENT 0x00000020UL
+#define WS_EX_NOACTIVATE 0x08000000UL
+#define CS_HREDRAW 0x0002
+#define THREAD_PRIORITY_BELOW_NORMAL -1
+#define THREAD_PRIORITY_LOWEST -2
+#define THREAD_PRIORITY_IDLE -15
+#define CS_VREDRAW 0x0001
+#define WM_DESTROY 0x0002
+#define WM_MOVE 0x0003
+#define WM_PAINT 0x000F
+#define WM_ERASEBKGND 0x0014
+#define WM_TIMER 0x0113
+#define WM_HOTKEY 0x0312
+#define WM_LBUTTONDOWN 0x0201
+#define WM_LBUTTONUP 0x0202
+#define WM_MOUSEMOVE 0x0200
+#define WM_KEYDOWN 0x0100
+#define WM_NCLBUTTONDOWN 0x00A1
+#define WM_SIZE 0x0005
+#define HTCAPTION 2
+#define VK_RSHIFT 0xA1
+#define VK_ESCAPE 0x1B
+#define VK_LBUTTON 0x01
+#define SW_HIDE 0
+#define SW_SHOW 5
+#define SW_SHOWNOACTIVATE 4
+#define SW_SHOWNORMAL 1
+#define SM_CXSCREEN 0
+#define SM_CYSCREEN 1
+#define HWND_TOPMOST ((HWND)(LONG_PTR)-1)
+#define HWND_NOTOPMOST ((HWND)(LONG_PTR)-2)
+#define SWP_NOMOVE 0x0002
+#define SWP_NOSIZE 0x0001
+#define SWP_NOACTIVATE 0x0010
+#define SWP_SHOWWINDOW 0x0040
+#define MOD_NOREPEAT 0x4000
+#define MENU_HOTKEY_ID 0x4D43
+#define LWA_COLORKEY 0x00000001
+#define LWA_ALPHA 0x00000002
+#define WM_RBUTTONDOWN 0x0204
+#define WM_MOUSEWHEEL 0x020A
+#define TRANSPARENT 1
+#define SRCCOPY 0x00CC0020
+#define COLORONCOLOR 3
+#define HALFTONE 4
+#define PS_SOLID 0
+#define NULL_PEN 8
+#define BLACK_BRUSH 4
+#define FW_NORMAL 400
+#define FW_SEMIBOLD 600
+#define FW_BOLD 700
+#define DEFAULT_CHARSET 1
+#define OUT_DEFAULT_PRECIS 0
+#define CLIP_DEFAULT_PRECIS 0
+#define CLEARTYPE_QUALITY 5
+#define DEFAULT_PITCH 0
+#define FF_DONTCARE 0
+#define DT_LEFT 0x00000000
+#define DT_CENTER 0x00000001
+#define DT_RIGHT 0x00000002
+#define DT_VCENTER 0x00000004
+#define DT_SINGLELINE 0x00000020
+#define DT_END_ELLIPSIS 0x00008000
+#define DT_NOPREFIX 0x00000800
+#define COLOR_WINDOW 5
+
+static COLORREF RGBc(int r,int g,int b){ return (COLORREF)(r | (g<<8) | (b<<16)); }
+static int LoWord(LPARAM v){ return (int)((WORD)(v & 0xffff)); }
+static int HiWord(LPARAM v){ return (int)((WORD)((v>>16)&0xffff)); }
+static ULONGLONG FtToU64(const FILETIME& f){ return ((ULONGLONG)f.dwHighDateTime<<32) | f.dwLowDateTime; }
+
+static int WLen(const wchar_t* s){ int n=0; while(s && s[n]) n++; return n; }
+static void WCopy(wchar_t* d,const wchar_t* s,int cap){ if(cap<=0)return; int i=0; for(;i<cap-1 && s && s[i];i++) d[i]=s[i]; d[i]=0; }
+static wchar_t ToLowerW(wchar_t c){ if(c>=L'A'&&c<=L'Z') return c+32; return c; }
+static BOOL WEqualI(const wchar_t* a,const wchar_t* b){ int i=0; for(;;i++){ wchar_t x=ToLowerW(a[i]), y=ToLowerW(b[i]); if(x!=y)return FALSE; if(!x)return TRUE; } }
+static BOOL WContainsI(const wchar_t* s,const wchar_t* needle){ int nl=WLen(needle); if(nl==0)return TRUE; for(int i=0;s[i];i++){ int j=0; while(j<nl && s[i+j] && ToLowerW(s[i+j])==ToLowerW(needle[j])) j++; if(j==nl)return TRUE; } return FALSE; }
+static void UIntToW(ULONGLONG v,wchar_t* out,int cap){ if(cap<2)return; wchar_t tmp[32]; int n=0; if(v==0)tmp[n++]=L'0'; else while(v&&n<31){tmp[n++]=(wchar_t)(L'0'+(v%10));v/=10;} int k=0; while(n&&k<cap-1)out[k++]=tmp[--n]; out[k]=0; }
+static void IntToW(int v,wchar_t* out,int cap){ if(v<0){ if(cap>1){out[0]=L'-'; UIntToW((ULONGLONG)(-v),out+1,cap-1);} } else UIntToW((ULONGLONG)v,out,cap); }
+static void WAppend(wchar_t* dst,const wchar_t* src,int cap){ int n=WLen(dst); int i=0; while(n<cap-1 && src && src[i]) dst[n++]=src[i++]; dst[n]=0; }
+
+// v25: no injected helper. JVM discovery is read-only from the external process; menu uses global hotkey + topmost show path.
+
+struct Config {
+    DWORD magic; DWORD version;
+    int autoDetect,preferVisible,lockTarget,showHud,alwaysOnTop,cpuWeight,memWeight,scanMs,hudAlpha;
+    int triggerEnabled,criticalOnly,hitPlayers,hitMobs,useSword,useMace;
+    int swordCooldownMs,maceCooldownMs;
+    int seeInvisible,showNames,invisAlpha,fov;
+    int accentR,accentG,accentB;
+};
+static Config g_cfg = {0x4D434647,4, 1,1,1,1,1,68,32,1000,92, 0,1,1,1,1,1, 625,1670, 0,0,58,70, 112,126,255};
+
+struct Candidate {
+    DWORD pid; DWORD ppid; wchar_t name[260]; ULONGLONG cpuTotal; ULONGLONG createTime; SIZE_T memBytes;
+    int cpuX10; int memMB; int visible; int score;
+};
+#define MAX_TRACKED_PROCESSES 2048
+#define MAX_UI_CANDIDATES 64
+static Candidate g_candidates[MAX_UI_CANDIDATES]; static int g_candidateCount=0;
+static Candidate g_target={};
+static DWORD g_visiblePids[MAX_TRACKED_PROCESSES]; static int g_visibleCount=0;
+static DWORD g_gameTitlePids[MAX_TRACKED_PROCESSES]; static int g_gameTitleCount=0;
+static DWORD g_startForegroundPid=0;
+static HWND g_main=0, g_hud=0;
+static BOOL g_menuVisible=FALSE, g_rshiftDown=FALSE, g_hotkeyRegistered=FALSE;
+static ULONGLONG g_lastMenuToggleTick=0;
+static int g_menuAnim=0, g_menuAnimTarget=0;
+static int g_menuCenterX=0, g_menuCenterY=0;
+static HDC g_menuDC=0; static HBITMAP g_menuBmp=0; static HGDIOBJ g_menuOld=0; static BOOL g_menuCacheValid=FALSE;
+static HDC g_hudDC=0; static HBITMAP g_hudBmp=0; static HGDIOBJ g_hudOld=0; static int g_hudBufW=0,g_hudBufH=0;
+static UINT g_uiTimerMs=16;
+static int g_lastHudX=-100000,g_lastHudY=-100000,g_lastHudW=0,g_lastHudH=0; static BOOL g_hudShown=FALSE; static int g_lastHudAlpha=-1;
+static ULONGLONG g_menuAnimStartTick=0; static int g_menuAnimStartValue=0;
+static int g_scroll[3]={0,0,0};
+static int g_dragSlider=0;
+static HFONT g_fontTitle=0,g_fontSub=0,g_fontBody=0,g_fontSmall=0,g_fontMetric=0;
+struct BrushCacheEntry { COLORREF color; HBRUSH brush; }; static BrushCacheEntry g_brushCache[24]={}; static int g_brushCacheNext=0;
+static HBRUSH BrushFor(COLORREF c){for(int i=0;i<24;i++)if(g_brushCache[i].brush&&g_brushCache[i].color==c)return g_brushCache[i].brush;for(int i=0;i<24;i++)if(!g_brushCache[i].brush){g_brushCache[i].color=c;g_brushCache[i].brush=CreateSolidBrush(c);return g_brushCache[i].brush;}int i=g_brushCacheNext++%24;if(g_brushCache[i].brush)DeleteObject(g_brushCache[i].brush);g_brushCache[i].color=c;g_brushCache[i].brush=CreateSolidBrush(c);return g_brushCache[i].brush;}
+static void ClearBrushCache(){for(int i=0;i<24;i++){if(g_brushCache[i].brush)DeleteObject(g_brushCache[i].brush);g_brushCache[i].brush=0;}g_brushCacheNext=0;}
+static wchar_t g_cfgPath[520]={0};
+static wchar_t g_targetWindow[260]={0};
+static HWND g_gameWnd=0;
+
+// Strict Pulse launcher target requested by the operator.
+// Minecraft 1.21.11 is hosted directly inside this EXE; there is no java.exe.
+static const wchar_t* STRICT_TARGET_NAME = L"pulse_launcher (2).exe";
+static const wchar_t* STRICT_TARGET_PATH = L"C:\Users\U10\Downloads\pulse_launcher (2).exe";
+static const wchar_t* STRICT_TARGET_TITLE = L"Minecraft";
+enum TargetHostMode { HOST_NONE=0, HOST_PULSE=1, HOST_JAVA=2, HOST_GENERIC=3 };
+static TargetHostMode g_targetHostMode=HOST_NONE;
+static BOOL g_targetNeedsGameTitle=FALSE; // true when selected from a real Minecraft-titled window
+static int g_targetTitleMisses=0;
+static DWORD g_bridgePidHint=0; static ULONGLONG g_bridgeCreateHint=0;
+
+static BOOL IsExcludedName(const wchar_t* n){
+    const wchar_t* ex[] = {L"system",L"system idle process",L"registry",L"smss.exe",L"csrss.exe",L"wininit.exe",L"winlogon.exe",L"services.exe",L"lsass.exe",L"svchost.exe",L"dwm.exe",L"explorer.exe",L"searchhost.exe",L"startmenuexperiencehost.exe",L"shellexperiencehost.exe",L"runtimebroker.exe",L"textinputhost.exe",L"applicationframehost.exe"};
+    for(int i=0;i<(int)(sizeof(ex)/sizeof(ex[0]));i++) if(WEqualI(n,ex[i])) return TRUE;
+    return FALSE;
+}
+static BOOL IsVisiblePid(DWORD pid){ for(int i=0;i<g_visibleCount;i++) if(g_visiblePids[i]==pid)return TRUE; return FALSE; }
+static BOOL IsGameTitlePid(DWORD pid){ for(int i=0;i<g_gameTitleCount;i++) if(g_gameTitlePids[i]==pid)return TRUE; return FALSE; }
+static BOOL CALLBACK EnumVisibleProc(HWND h, LPARAM){
+    if(!IsWindowVisible(h)) return TRUE;
+    DWORD pid=0; GetWindowThreadProcessId(h,&pid); if(!pid)return TRUE;
+    // A fullscreen/custom GLFW window may have an empty title. Keep the PID visible
+    // even then so the rare known-host fallback can still recover Pulse/Java clients.
+    BOOL seen=FALSE; for(int i=0;i<g_visibleCount;i++) if(g_visiblePids[i]==pid){seen=TRUE;break;}
+    if(!seen && g_visibleCount<MAX_TRACKED_PROCESSES)g_visiblePids[g_visibleCount++]=pid;
+    int titleLen=GetWindowTextLengthW(h); if(titleLen<=0) return TRUE;
+    wchar_t title[260]; title[0]=0; GetWindowTextW(h,title,260);
+    if(WContainsI(title,L"minecraft")&&!WContainsI(title,L"Minecraft Launcher")){BOOL gs=FALSE;for(int i=0;i<g_gameTitleCount;i++)if(g_gameTitlePids[i]==pid){gs=TRUE;break;}if(!gs&&g_gameTitleCount<MAX_TRACKED_PROCESSES)g_gameTitlePids[g_gameTitleCount++]=pid;}
+    return TRUE;
+}
+static BOOL IsMinecraftGameTitle(const wchar_t* title){
+    return title && WContainsI(title,STRICT_TARGET_TITLE) && !WContainsI(title,L"Minecraft Launcher");
+}
+static DWORD g_titlePid=0;
+static BOOL CALLBACK EnumTargetTitle(HWND h, LPARAM){
+    if(!IsWindowVisible(h))return TRUE;DWORD pid=0;GetWindowThreadProcessId(h,&pid);if(pid!=g_titlePid)return TRUE;
+    int n=GetWindowTextLengthW(h);if(n<=0)return TRUE;wchar_t title[260];title[0]=0;GetWindowTextW(h,title,260);
+    // Prefer an actual Minecraft title. For custom-title embedded clients keep the first visible
+    // window as a fallback so detection survives launchers that rewrite the GLFW title.
+    if(IsMinecraftGameTitle(title)){WCopy(g_targetWindow,title,260);g_gameWnd=h;return FALSE;}
+    if(!g_gameWnd){WCopy(g_targetWindow,title,260);g_gameWnd=h;}
+    return TRUE;
+}
+static BOOL GetProcessPathStrict(DWORD pid,wchar_t*out,int cap){
+    if(!out||cap<2)return FALSE;out[0]=0;
+    HANDLE ph=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);if(!ph)ph=OpenProcess(PROCESS_QUERY_INFORMATION,FALSE,pid);if(!ph)return FALSE;
+    DWORD n=(DWORD)cap;BOOL ok=QueryFullProcessImageNameW(ph,0,out,&n);CloseHandle(ph);
+    if(!ok||n==0){out[0]=0;return FALSE;}if(n>=(DWORD)cap)n=(DWORD)cap-1;out[n]=0;return TRUE;
+}
+static BOOL ProcessHasJvmDll(DWORD pid){
+    HANDLE s=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);
+    if(s==INVALID_HANDLE_VALUE)return FALSE;
+    MODULEENTRY32W me;memset(&me,0,sizeof(me));me.dwSize=sizeof(me);BOOL found=FALSE;
+    if(Module32FirstW(s,&me)){do{if(WEqualI(me.szModule,L"jvm.dll")){found=TRUE;break;}}while(Module32NextW(s,&me));}
+    CloseHandle(s);return found;
+}
+static ULONGLONG GetProcCreateTimeValue(DWORD pid){HANDLE ph=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);if(!ph)return 0;FILETIME c,e,k,u;ULONGLONG v=0;if(GetProcessTimes(ph,&c,&e,&k,&u))v=FtToU64(c);CloseHandle(ph);return v;}
+// ========================= v23 window-first detector =========================
+// Fast path is window-first: enumerate top-level windows, map a Minecraft window to its PID,
+// then inspect only that PID. A full process snapshot is a rare fallback for custom-title clients.
+static const wchar_t* BaseNamePtr(const wchar_t* path){
+    if(!path)return L"";const wchar_t* b=path;for(int i=0;path[i];i++)if(path[i]==L'\'||path[i]==L'/')b=path+i+1;return b;
+}
+static BOOL IsKnownEmbeddedClient(const wchar_t* name,const wchar_t* path){
+    const wchar_t* marks[]={L"pulse",L"lunar",L"badlion",L"feather",L"altber",L"aiaber",L"prismlauncher",L"multimc",L"modrinth",L"curseforge",L"atlauncher",L"minecraft"};
+    for(int i=0;i<(int)(sizeof(marks)/sizeof(marks[0]));i++)if(WContainsI(name,marks[i])||WContainsI(path,marks[i]))return TRUE;
+    return FALSE;
+}
+static BOOL IsDirectGameHostName(const wchar_t* name,const wchar_t* path){
+    // These are known to host the game/JVM directly. Launcher-only shells such as Prism/MultiMC
+    // are intentionally excluded from the foreground shortcut to avoid false attachment.
+    const wchar_t* marks[]={L"pulse",L"lunar",L"badlion",L"feather",L"altber",L"aiaber"};
+    for(int i=0;i<(int)(sizeof(marks)/sizeof(marks[0]));i++)if(WContainsI(name,marks[i])||WContainsI(path,marks[i]))return TRUE;
+    return FALSE;
+}
+static BOOL BuildCandidateFromPid(DWORD pid,Candidate*out,TargetHostMode*mode,BOOL requireGameWindow){
+    if(!pid||pid==GetCurrentProcessId()||!out||!mode)return FALSE;
+    wchar_t path[520];path[0]=0;if(!GetProcessPathStrict(pid,path,520))return FALSE;
+    const wchar_t* base=BaseNamePtr(path);if(!base[0]||IsExcludedName(base))return FALSE;
+    BOOL gameTitle=IsGameTitlePid(pid);if(requireGameWindow&&!gameTitle)return FALSE;
+    BOOL visible=IsVisiblePid(pid);
+    BOOL pulse=WContainsI(base,L"pulse_launcher")||WContainsI(base,L"pulse launcher")||WContainsI(path,L"pulse_launcher")||WContainsI(path,L"pulse launcher");
+    BOOL java=WEqualI(base,L"java.exe")||WEqualI(base,L"javaw.exe");
+    BOOL known=IsKnownEmbeddedClient(base,path);
+    int score=0;TargetHostMode m=HOST_NONE;
+    if(pulse){m=HOST_PULSE;score=5000;if(WEqualI(base,STRICT_TARGET_NAME))score+=700;if(WEqualI(path,STRICT_TARGET_PATH))score+=700;}
+    else if(java){m=HOST_JAVA;score=4300;if(WEqualI(base,L"javaw.exe"))score+=120;}
+    else if(known){m=HOST_GENERIC;score=3600;}
