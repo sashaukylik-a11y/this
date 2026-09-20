@@ -689,3 +689,64 @@ static BOOL FindClassesBatch(WantedClass* wants,int wantCount){
     if(!wants||wantCount<=0)return FALSE;for(int i=0;i<wantCount;i++)if(wants[i].out)*wants[i].out=0;
     U64 cld=R64(g_bridge.cldHeadAddr);char n[180];int unresolved=wantCount,cc=0;
     for(int cg=0;cld&&cg<10000&&unresolved>0;cg++,cld=R64(cld+g_bridge.cldNext)){U64 k=R64(cld+g_bridge.cldKlasses);for(int kg=0;k&&kg<120000&&unresolved>0;kg++,k=R64(k+g_bridge.klassNext)){
+
+            cc++;if(!KlassName(k,n,180))continue;
+            for(int i=0;i<wantCount;i++)if(wants[i].out&&!*wants[i].out&&MatchAny(n,wants[i].aliases,wants[i].aliasCount)){*wants[i].out=k;unresolved--;}
+        }
+    }
+    g_bridge.classesScanned=cc;return unresolved==0;
+}
+static U64 FindSuperClassAliases(U64 start,const char*const* aliases,int aliasCount){char n[180];for(U64 k=start,g=0;k&&g<64;g++,k=R64(k+g_bridge.klassSuper)){if(KlassName(k,n,180)&&MatchAny(n,aliases,aliasCount))return k;}return 0;}
+static BOOL ReadCPSymbol(U64 cp,U16 idx,char*out,int cap){if(!cp||!idx)return FALSE;U64 sp=R64(cp+(U64)g_bridge.cpSize+(U64)idx*8ULL);return ReadSymbol(sp,out,cap);}
+static BOOL U5Next(U64 data,int limit,int*pos,U32*out){
+    if(!data||!pos||!out||*pos<0||*pos>=limit)return FALSE;int p=*pos;U32 b=R8(data+(U64)p);if(b<1)return FALSE;U32 sum=b-1;p++;if(sum<191){*pos=p;*out=sum;return TRUE;}int shift=6;
+    for(int i=1;i<5;i++){if(p>=limit)return FALSE;b=R8(data+(U64)p);if(b<1)return FALSE;sum+=(b-1)<<shift;p++;if(b<192||i==4){*pos=p;*out=sum;return TRUE;}shift+=6;}return FALSE;
+}
+static BOOL FindFieldDeclaredLegacy(U64 k,const char*const* aliases,int aliasCount,RemoteField*out){
+    if(g_bridge.ikFields<0)return FALSE;U64 fa=R64(k+g_bridge.ikFields),cp=R64(k+g_bridge.ikConstants);if(!fa||!cp)return FALSE;int len=(int)R32(fa);if(len<=0||len>12000)return FALSE;char nm[96],sig[96];int fc=len/6;U64 d=fa+4;
+    for(int i=0;i<fc;i++){U64 b=d+(U64)i*12;U16 access=R16(b),ni=R16(b+2),si=R16(b+4),lo=R16(b+8),hi=R16(b+10);if(!ReadCPSymbol(cp,ni,nm,96)||!MatchAny(nm,aliases,aliasCount))continue;U32 packed=(U32)lo|((U32)hi<<16);U32 off=(packed&3u)==1u?(packed>>2):packed;out->offset=(int)off;out->access=access;out->found=TRUE;out->sig[0]=0;ReadCPSymbol(cp,si,sig,96);ACopy(out->sig,sig,96);return TRUE;}return FALSE;
+}
+static BOOL FindFieldDeclaredU5(U64 k,const char*const* aliases,int aliasCount,RemoteField*out){
+    if(g_bridge.ikFieldInfoStream<0)return FALSE;U64 fis=R64(k+g_bridge.ikFieldInfoStream),cp=R64(k+g_bridge.ikConstants);if(!fis||!cp)return FALSE;int bytes=(int)R32(fis);if(bytes<=0||bytes>262144)return FALSE;U64 data=fis+4;int pos=0;U32 javaCount=0,injectedCount=0;if(!U5Next(data,bytes,&pos,&javaCount)||!U5Next(data,bytes,&pos,&injectedCount))return FALSE;if(javaCount>8192||injectedCount>1024)return FALSE;char nm[96],sig[96];
+    for(U32 i=0;i<javaCount;i++){U32 ni=0,si=0,off=0,access=0,flags=0;if(!U5Next(data,bytes,&pos,&ni)||!U5Next(data,bytes,&pos,&si)||!U5Next(data,bytes,&pos,&off)||!U5Next(data,bytes,&pos,&access)||!U5Next(data,bytes,&pos,&flags))return FALSE;if(flags&1u){U32 z;if(!U5Next(data,bytes,&pos,&z))return FALSE;}if(flags&4u){U32 z;if(!U5Next(data,bytes,&pos,&z))return FALSE;}if(flags&16u){U32 z;if(!U5Next(data,bytes,&pos,&z))return FALSE;}if(ni>65535||si>65535)continue;if(!ReadCPSymbol(cp,(U16)ni,nm,96)||!MatchAny(nm,aliases,aliasCount))continue;out->offset=(int)off;out->access=(U16)access;out->found=TRUE;out->sig[0]=0;ReadCPSymbol(cp,(U16)si,sig,96);ACopy(out->sig,sig,96);return TRUE;}return FALSE;
+}
+static BOOL FindFieldOnKlass(U64 start,const char*const* aliases,int aliasCount,RemoteField*out){if(!start||!out)return FALSE;for(U64 k=start,sg=0;k&&sg<64;sg++,k=R64(k+g_bridge.klassSuper)){if(g_bridge.ikFieldInfoStream>=0){if(FindFieldDeclaredU5(k,aliases,aliasCount,out))return TRUE;}else if(FindFieldDeclaredLegacy(k,aliases,aliasCount,out))return TRUE;}return FALSE;}
+static BOOL FindField1(U64 k,const char*a,RemoteField*out){const char* x[]={a};return FindFieldOnKlass(k,x,1,out);} 
+static BOOL FindField3(U64 k,const char*a,const char*b,const char*c,RemoteField*out){const char*x[]={a,b,c};return FindFieldOnKlass(k,x,3,out);} 
+static BOOL FindField4(U64 k,const char*a,const char*b,const char*c,const char*d,RemoteField*out){const char*x[]={a,b,c,d};return FindFieldOnKlass(k,x,4,out);} 
+static U64 KlassMirror(U64 k){U64 handle=R64(k+g_bridge.klassJavaMirror);return handle?R64(handle):0;}
+static U64 ReadStaticOop(U64 k,const RemoteField& f){U64 m=KlassMirror(k);return (m&&f.found)?ReadOopAt(m+f.offset):0;}
+static U64 ReadObjField(U64 o,const RemoteField&f){return (o&&f.found)?ReadOopAt(o+f.offset):0;}
+
+static BOOL ReadSharedFlags(U64 p,U8* out){if(!out||!p)return FALSE;RemoteField df=g_bridge.entData;if(!df.found){U64 pk=ResolveKlass(p);const char*ea[]={"cgk","net/minecraft/class_1297","net/minecraft/world/entity/Entity","net/minecraft/entity/Entity"};U64 decl=FindSuperClassAliases(pk,ea,4);if(!decl||!FindField4(decl,"az","field_6011","entityData","dataTracker",&df))return FALSE;}U64 data=ReadObjField(p,df);if(!data)return FALSE;RemoteField ef=g_bridge.dataItems;if(!ef.found){U64 dk=ResolveKlass(data);if(!FindField4(dk,"e","field_13331","itemsById","entries",&ef))return FALSE;}U64 arr=ReadObjField(data,ef);if(!arr)return FALSE;U64 entry=ReadOopAt(arr+16);if(!entry)entry=ReadOopAt(arr+24);if(!entry)return FALSE;RemoteField vf=g_bridge.dataItemValue;if(!vf.found){U64 ek=ResolveKlass(entry);if(!FindField4(ek,"b","field_13338","value","initialValue",&vf))return FALSE;}U64 boxed=ReadObjField(entry,vf);if(!boxed)return FALSE;RemoteField bv=g_bridge.boxedByteValue;if(!bv.found){U64 bk=ResolveKlass(boxed);if(!FindField1(bk,"value",&bv))return FALSE;}*out=R8(boxed+bv.offset);return TRUE;}
+static BOOL ReadLocalSharedFlags(U64 p,U8*out){return ReadSharedFlags(p,out);}
+
+static BOOL CacheGameFields(){
+    const char* mcAliases[]={"gfj","net/minecraft/class_310","net/minecraft/client/Minecraft","net/minecraft/client/MinecraftClient"};
+    const char* itAliases[]={"dlx","net/minecraft/class_1802","net/minecraft/world/item/Items","net/minecraft/item/Items"};
+    const char* stackAliases[]={"net/minecraft/class_1799","net/minecraft/world/item/ItemStack","net/minecraft/item/ItemStack"};
+    const char* playerAliases[]={"ddm","net/minecraft/class_1657","net/minecraft/world/entity/player/Player","net/minecraft/entity/player/PlayerEntity"};
+    const char* livingAliases[]={"chl","net/minecraft/class_1309","net/minecraft/world/entity/LivingEntity","net/minecraft/entity/LivingEntity"};
+    const char* entityAliases[]={"cgk","net/minecraft/class_1297","net/minecraft/world/entity/Entity","net/minecraft/entity/Entity"};
+    WantedClass wants[]={{mcAliases,4,&g_bridge.mcKlass},{itAliases,4,&g_bridge.itemsKlass},{stackAliases,3,&g_bridge.itemStackKlass},{playerAliases,4,&g_bridge.playerKlass},{livingAliases,4,&g_bridge.livingKlass},{entityAliases,4,&g_bridge.entityKlass}};
+    if(!FindClassesBatch(wants,(int)(sizeof(wants)/sizeof(wants[0]))))return FALSE;
+    if(!FindField4(g_bridge.mcKlass,"A","field_1700","instance","INSTANCE",&g_bridge.mcInstance))return FALSE;
+    FindField3(g_bridge.mcKlass,"s","field_1724","player",&g_bridge.mcPlayer);FindField4(g_bridge.mcKlass,"t","field_1692","crosshairPickEntity","targetedEntity",&g_bridge.mcTarget);FindField3(g_bridge.mcKlass,"x","field_1755","screen",&g_bridge.mcScreen);
+    FindField4(g_bridge.playerKlass,"cK","field_7525","lastItemInMainHand","selectedItem",&g_bridge.playerHeld);FindField3(g_bridge.livingKlass,"bz","field_6273","attackStrengthTicker",&g_bridge.livingAttackTicker);
+    FindField3(g_bridge.entityKlass,"bc","field_5952","onGround",&g_bridge.entOnGround);FindField3(g_bridge.entityKlass,"an","field_6017","fallDistance",&g_bridge.entFall);FindField3(g_bridge.entityKlass,"aT","field_6034","vehicle",&g_bridge.entVehicle);FindField4(g_bridge.entityKlass,"au","field_5957","wasTouchingWater","touchingWater",&g_bridge.entWater);FindField4(g_bridge.entityKlass,"aw","field_6000","wasEyeInWater","submergedInWater",&g_bridge.entEyeWater);FindField4(g_bridge.entityKlass,"az","field_6011","entityData","dataTracker",&g_bridge.entData);FindField3(g_bridge.itemStackKlass,"t","field_8038","item",&g_bridge.stackItem);
+    const char* swordObf[7]={"qn","qs","qx","qC","qH","qM","qR"};const char* swordInt[7]={"field_8091","field_61338","field_8528","field_8845","field_8371","field_8802","field_22022"};const char* swordNamed[7]={"WOODEN_SWORD","COPPER_SWORD","STONE_SWORD","GOLDEN_SWORD","IRON_SWORD","DIAMOND_SWORD","NETHERITE_SWORD"};
+    for(int i=0;i<7;i++)FindField3(g_bridge.itemsKlass,swordObf[i],swordInt[i],swordNamed[i],&g_bridge.swordItemFields[i]);FindField3(g_bridge.itemsKlass,"wn","field_49814","MACE",&g_bridge.maceItemField);
+    BOOL anyWeaponRoot=g_bridge.maceItemField.found;for(int i=0;i<7;i++)if(g_bridge.swordItemFields[i].found)anyWeaponRoot=TRUE;
+    return g_bridge.mcInstance.found&&g_bridge.mcPlayer.found&&g_bridge.mcTarget.found&&g_bridge.mcScreen.found&&g_bridge.playerHeld.found&&g_bridge.stackItem.found&&g_bridge.livingAttackTicker.found&&anyWeaponRoot;
+}
+struct ProcEdge { DWORD pid; DWORD ppid; };
+static ProcEdge g_procEdges[2048];
+static int SnapshotProcEdges(ProcEdge* out,int cap){if(!out||cap<=0)return 0;HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);if(snap==INVALID_HANDLE_VALUE)return 0;PROCESSENTRY32W pe;memset(&pe,0,sizeof(pe));pe.dwSize=sizeof(pe);int n=0;if(Process32FirstW(snap,&pe))do{if(pe.th32ProcessID&&n<cap){out[n].pid=pe.th32ProcessID;out[n].ppid=pe.th32ParentProcessID;n++;}}while(Process32NextW(snap,&pe));CloseHandle(snap);return n;}
+static BOOL BridgeHostNameLikely(DWORD pid){wchar_t path[520];path[0]=0;if(!GetProcessPathStrict(pid,path,520))return FALSE;const wchar_t* b=BaseNamePtr(path);return WEqualI(b,L"java.exe")||WEqualI(b,L"javaw.exe")||WContainsI(b,L"pulse")||WContainsI(b,L"lunar")||WContainsI(b,L"badlion")||WContainsI(b,L"feather")||WContainsI(b,L"minecraft")||WContainsI(b,L"aiaber")||WContainsI(b,L"altber");}
+static BOOL BridgeHostNameBad(DWORD pid){wchar_t path[520];path[0]=0;if(!GetProcessPathStrict(pid,path,520))return TRUE;const wchar_t* b=BaseNamePtr(path);return WContainsI(b,L"webview")||WContainsI(b,L"crash")||WContainsI(b,L"updater")||WContainsI(b,L"update")||WContainsI(b,L"renderer")||WContainsI(b,L"cef")||WContainsI(b,L"helper");}
+static int AddUniquePid(DWORD* out,int n,int cap,DWORD pid){if(!pid)return n;for(int i=0;i<n;i++)if(out[i]==pid)return n;if(n<cap)out[n++]=pid;return n;}
+static U64 AbsDiff64(U64 a,U64 b){return a>b?a-b:b-a;}
+struct HostRank {DWORD pid;U64 delta;int score;};
+static void AddRankedHost(HostRank* a,int* n,int cap,DWORD pid,U64 rootCreate,int bonus){if(!a||!n||!pid||*n>=cap)return;for(int i=0;i<*n;i++)if(a[i].pid==pid)return;U64 ct=GetProcCreateTimeValue(pid);if(!ct)return;U64 d=AbsDiff64(ct,rootCreate);int score=bonus;if(d<=120ULL*10000000ULL)score+=800-(int)(d/(1500000ULL));a[*n].pid=pid;a[*n].delta=d;a[*n].score=score;(*n)++;}
+static void SortHosts(HostRank* a,int n){for(int i=1;i<n;i++){HostRank v=a[i];int j=i-1;while(j>=0&&a[j].score<v.score){a[j+1]=a[j];j--;}a[j+1]=v;}}
+static __declspec(noinline) int BuildBridgeHostList(DWORD root,DWORD* out,int cap){
