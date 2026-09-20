@@ -439,3 +439,96 @@ static BOOL BuildCandidateFromPid(DWORD pid,Candidate*out,TargetHostMode*mode,BO
     if(pulse){m=HOST_PULSE;score=5000;if(WEqualI(base,STRICT_TARGET_NAME))score+=700;if(WEqualI(path,STRICT_TARGET_PATH))score+=700;}
     else if(java){m=HOST_JAVA;score=4300;if(WEqualI(base,L"javaw.exe"))score+=120;}
     else if(known){m=HOST_GENERIC;score=3600;}
+
+    else if(gameTitle){m=HOST_GENERIC;score=3000;}
+    else return FALSE;
+    if(gameTitle)score+=1200;if(visible)score+=150;if(pid==g_startForegroundPid)score+=100;
+    memset(out,0,sizeof(*out));out->pid=pid;out->createTime=GetProcCreateTimeValue(pid);if(!out->createTime)return FALSE;out->visible=visible?1:0;out->score=score;WCopy(out->name,base,260);*mode=m;return TRUE;
+}
+static void AddUiCandidate(const Candidate& c){
+    if(!c.pid)return;
+    for(int i=0;i<g_candidateCount;i++)if(g_candidates[i].pid==c.pid)return;
+    int pos=g_candidateCount<MAX_UI_CANDIDATES?g_candidateCount++:MAX_UI_CANDIDATES-1;
+    if(pos<0)return;g_candidates[pos]=c;
+    while(pos>0&&g_candidates[pos].score>g_candidates[pos-1].score){Candidate t=g_candidates[pos-1];g_candidates[pos-1]=g_candidates[pos];g_candidates[pos]=t;pos--;}
+}
+static BOOL FallbackKnownProcessScan(Candidate*best,TargetHostMode*bestMode){
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);if(snap==INVALID_HANDLE_VALUE)return FALSE;
+    PROCESSENTRY32W pe;memset(&pe,0,sizeof(pe));pe.dwSize=sizeof(pe);BOOL found=FALSE;int bestScore=-1;
+    if(Process32FirstW(snap,&pe))do{
+        if(!pe.th32ProcessID||pe.th32ProcessID==4||pe.th32ProcessID==GetCurrentProcessId())continue;
+        BOOL likely=WContainsI(pe.szExeFile,L"pulse")||WEqualI(pe.szExeFile,L"java.exe")||WEqualI(pe.szExeFile,L"javaw.exe")||WContainsI(pe.szExeFile,L"lunar")||WContainsI(pe.szExeFile,L"badlion")||WContainsI(pe.szExeFile,L"feather")||WContainsI(pe.szExeFile,L"altber")||WContainsI(pe.szExeFile,L"aiaber")||WContainsI(pe.szExeFile,L"prism")||WContainsI(pe.szExeFile,L"multimc")||WContainsI(pe.szExeFile,L"modrinth")||WContainsI(pe.szExeFile,L"atlauncher");
+        if(!likely||!IsVisiblePid(pe.th32ProcessID))continue;
+        Candidate c={};TargetHostMode m=HOST_NONE;if(!BuildCandidateFromPid(pe.th32ProcessID,&c,&m,FALSE))continue;
+        if(m==HOST_JAVA&&!ProcessHasJvmDll(c.pid))continue;
+        if(!found||c.score>bestScore){*best=c;*bestMode=m;bestScore=c.score;found=TRUE;}AddUiCandidate(c);
+    }while(Process32NextW(snap,&pe));
+    CloseHandle(snap);return found;
+}
+static void GatherCandidates(BOOL useDelta){
+    (void)useDelta;
+    g_visibleCount=0;g_gameTitleCount=0;EnumWindows(EnumVisibleProc,0);
+    g_candidateCount=0;
+    Candidate best={};TargetHostMode bestMode=HOST_NONE;int bestScore=-1;BOOL bestFromGameTitle=FALSE;
+    for(int i=0;i<g_gameTitleCount;i++){
+        Candidate c={};TargetHostMode m=HOST_NONE;if(!BuildCandidateFromPid(g_gameTitlePids[i],&c,&m,TRUE))continue;AddUiCandidate(c);
+        if(c.score>bestScore){best=c;bestMode=m;bestScore=c.score;bestFromGameTitle=TRUE;}
+    }
+    if(!best.pid){HWND fg=GetForegroundWindow();DWORD fp=0;if(fg)GetWindowThreadProcessId(fg,&fp);if(fp&&IsVisiblePid(fp)){Candidate c={};TargetHostMode m=HOST_NONE;if(BuildCandidateFromPid(fp,&c,&m,FALSE)&&IsDirectGameHostName(c.name,L"")){best=c;bestMode=m;bestFromGameTitle=FALSE;AddUiCandidate(c);}}}
+    if(!best.pid&&useDelta){if(FallbackKnownProcessScan(&best,&bestMode))bestFromGameTitle=FALSE;}
+    if(best.pid){g_target=best;g_targetHostMode=bestMode;g_targetNeedsGameTitle=bestFromGameTitle;g_targetTitleMisses=0;}else{memset(&g_target,0,sizeof(g_target));g_targetHostMode=HOST_NONE;g_targetNeedsGameTitle=FALSE;g_targetTitleMisses=0;}
+    g_targetWindow[0]=0;g_gameWnd=0;if(g_target.pid){g_titlePid=g_target.pid;EnumWindows(EnumTargetTitle,0);}
+    g_bridgePidHint=g_target.pid;g_bridgeCreateHint=g_target.createTime;
+}
+static void InitialDetect(){ GatherCandidates(FALSE); }
+
+static void BuildCfgPath(){ DWORD n=GetModuleFileNameW(0,g_cfgPath,520); if(n==0||n>=519){WCopy(g_cfgPath,L"MonoClient.cfg",520);return;} int slash=-1; for(int i=0;g_cfgPath[i];i++)if(g_cfgPath[i]==L'\'||g_cfgPath[i]==L'/')slash=i; if(slash>=0)g_cfgPath[slash+1]=0; else g_cfgPath[0]=0; WAppend(g_cfgPath,L"MonoClient.cfg",520); }
+static void LoadConfig(){ BuildCfgPath(); DWORD oldVersion=0; HANDLE h=CreateFileW(g_cfgPath,GENERIC_READ,FILE_SHARE_READ,0,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,0); if(h!=INVALID_HANDLE_VALUE){Config c;DWORD got=0;if(ReadFile(h,&c,sizeof(c),&got,0)&&got==sizeof(c)&&c.magic==0x4D434647&&(c.version==2||c.version==3||c.version==4)){oldVersion=c.version;g_cfg=c;if(c.version==2)g_cfg.hitMobs=1;g_cfg.version=4;g_cfg.preferVisible=!!g_cfg.preferVisible;g_cfg.showHud=!!g_cfg.showHud;g_cfg.alwaysOnTop=!!g_cfg.alwaysOnTop;g_cfg.triggerEnabled=!!g_cfg.triggerEnabled;g_cfg.criticalOnly=!!g_cfg.criticalOnly;g_cfg.hitPlayers=!!g_cfg.hitPlayers;g_cfg.hitMobs=!!g_cfg.hitMobs;g_cfg.useSword=!!g_cfg.useSword;g_cfg.useMace=!!g_cfg.useMace;g_cfg.seeInvisible=!!g_cfg.seeInvisible;g_cfg.showNames=!!g_cfg.showNames;g_cfg.swordCooldownMs=625;g_cfg.maceCooldownMs=1670;g_cfg.seeInvisible=0;g_cfg.showNames=0;if(g_cfg.invisAlpha<20||g_cfg.invisAlpha>90)g_cfg.invisAlpha=58;if(g_cfg.fov<30||g_cfg.fov>120)g_cfg.fov=70;if(g_cfg.accentR<0||g_cfg.accentR>255)g_cfg.accentR=112;if(g_cfg.accentG<0||g_cfg.accentG>255)g_cfg.accentG=126;if(g_cfg.accentB<0||g_cfg.accentB>255)g_cfg.accentB=255;if(g_cfg.scanMs<300||g_cfg.scanMs>3000)g_cfg.scanMs=1000;}CloseHandle(h);}g_cfg.autoDetect=1;g_cfg.lockTarget=1;g_cfg.seeInvisible=0;g_cfg.showNames=0;g_cfg.swordCooldownMs=625;g_cfg.maceCooldownMs=1670;if(oldVersion>0&&oldVersion<4){g_cfg.showHud=1;g_cfg.alwaysOnTop=1;}}
+static void SaveConfig(){ HANDLE h=CreateFileW(g_cfgPath,GENERIC_WRITE,0,0,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,0); if(h==INVALID_HANDLE_VALUE)return; DWORD w=0;WriteFile(h,&g_cfg,sizeof(g_cfg),&w,0);CloseHandle(h); }
+
+typedef unsigned long long U64;
+typedef unsigned int U32;
+typedef unsigned short U16;
+typedef unsigned char U8;
+
+static BOOL AEq(const char* a,const char* b){int i=0;for(;;i++){if(a[i]!=b[i])return FALSE;if(!a[i])return TRUE;}}
+static BOOL AEndsI(const wchar_t* s,const wchar_t* tail){int a=WLen(s),b=WLen(tail);if(b>a)return FALSE;return WEqualI(s+a-b,tail);}
+static void ACopy(char* d,const char* s,int cap){if(cap<=0)return;int i=0;for(;i<cap-1&&s&&s[i];i++)d[i]=s[i];d[i]=0;}
+
+enum BridgeState { BR_OFF=0, BR_ATTACHING=1, BR_READY=2, BR_UNSUPPORTED=3 };
+enum WeaponKind { WPN_NONE=0, WPN_SWORD=1, WPN_MACE=2 };
+enum TargetKind { TGT_NONE=0, TGT_PLAYER=1, TGT_MOB=2, TGT_OTHER=3 };
+struct TargetKindCacheEntry { U64 klass; TargetKind kind; };
+static TargetKindCacheEntry g_targetKindCache[12]={}; static int g_targetKindCacheNext=0;
+
+struct RemoteField { int offset; U16 access; char sig[96]; BOOL found; };
+struct BridgeVM {
+    HANDLE process; DWORD pid; U64 createTime; DWORD hostPid; U64 hostCreateTime; U64 jvmBase; U64 jvmSpan; BridgeState state;
+    int structsParsed; int heuristicStructs; int classesScanned; char status[128];
+    U64 cldHeadAddr; int cldNext,cldKlasses;
+    int klassName,klassNext,klassSuper,klassJavaMirror,klassLayout;
+    int oopKlass,oopCompressedKlass;
+    int ikFields,ikFieldInfoStream,ikConstants; int symLength,symBody; int cpSize;
+    U64 coopsBaseAddr,coopsShiftAddr,cklassBaseAddr,cklassShiftAddr;
+    U64 coopsBase,cklassBase; int coopsShift,cklassShift;
+    U64 mcKlass,itemsKlass,itemStackKlass,playerKlass,livingKlass,entityKlass;
+    RemoteField mcInstance,mcPlayer,mcTarget,mcScreen,mcWorld,mcGameRenderer;
+    RemoteField playerHeld,playerProfile;
+    RemoteField stackItem;
+    RemoteField swordItemFields[7],maceItemField;
+    RemoteField entOnGround,entFall,entVehicle,entWater,entEyeWater,entData,entPos;
+    RemoteField livingAttackTicker;
+    RemoteField levelPlayers;
+    RemoteField dataItems,dataItemValue,boxedByteValue;
+    RemoteField listElementData,listSize;
+    RemoteField gameProfileName,javaStringValue;
+    RemoteField rendererCamera;
+    RemoteField cameraPos,cameraYaw,cameraPitch;
+    RemoteField vecX,vecY,vecZ;
+};
+static BridgeVM g_bridge={};
+static DWORD g_diagHostPid=0; static wchar_t g_diagHostName[260]={0}; static int g_diagHostsTried=0; static int g_diagFailRank=0;
+static BYTE g_hotspotScanBuf[262144];
+
+struct InvisibleInfo { U64 oop; double x,y,z; char name[64]; };
+struct GameSnapshot {
