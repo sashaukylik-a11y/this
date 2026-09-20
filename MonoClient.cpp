@@ -631,3 +631,61 @@ static U64 FindJvmBase(DWORD pid){
             if(moduleCount<1024){moduleBases[moduleCount]=mb;moduleHints[moduleCount]=(U8)(hint?1:0);moduleCount++;}
             if(jn)sawJvmNamed=TRUE;
             if(jn){
+
+                if(LooksLikeHotSpotImage(mb)){CloseHandle(snap);g_bridge.heuristicStructs=0;g_bridge.jvmSpan=RemoteImageSize(mb);return mb;}
+                if(HasHotSpotMarkers(mb)){CloseHandle(snap);g_bridge.heuristicStructs=1;g_bridge.jvmSpan=RemoteImageSize(mb);return mb;}
+            }
+        }while(Module32NextW(snap,&me));
+        CloseHandle(snap);
+    }
+    for(int i=0;i<moduleCount;i++){if(LooksLikeHotSpotImage(moduleBases[i])){g_bridge.heuristicStructs=0;g_bridge.jvmSpan=RemoteImageSize(moduleBases[i]);return moduleBases[i];}if((i&15)==15)Sleep(0);}
+    wchar_t pp[520];pp[0]=0;GetProcessPathStrict(pid,pp,520);const wchar_t* pb=BaseNamePtr(pp);
+    BOOL direct=(pid==g_bridge.pid)||WContainsI(pb,L"pulse")||WContainsI(pb,L"lunar")||WContainsI(pb,L"badlion")||WContainsI(pb,L"feather")||WContainsI(pb,L"aiaber")||WContainsI(pb,L"altber");
+    BOOL deepAllowed=direct||sawJvmNamed;if(!deepAllowed)return 0;
+    for(int i=0;i<moduleCount;i++){if(i!=0&&!moduleHints[i])continue;U64 sz=RemoteImageSize(moduleBases[i]);if(sz>=0x200000&&sz<=0x08000000&&HasHotSpotMarkers(moduleBases[i])){g_bridge.heuristicStructs=1;g_bridge.jvmSpan=sz;return moduleBases[i];}if((i&3)==3)Sleep(0);}
+    if(!g_bridge.process)return 0;U64 addr=0x10000ULL,lastAlloc=0;int allocs=0;MEMORY_BASIC_INFORMATION_X64 mbi;
+    while(addr<0x0000800000000000ULL){SIZE_T q=VirtualQueryEx(g_bridge.process,(LPCVOID)(ULONG_PTR)addr,&mbi,sizeof(mbi));if(q!=sizeof(mbi))break;U64 ab=(U64)(ULONG_PTR)mbi.AllocationBase;BOOL candidateType=(mbi.Type==MEM_IMAGE||mbi.Type==MEM_MAPPED||mbi.Type==MEM_PRIVATE);
+        if(mbi.State==MEM_COMMIT&&candidateType&&ab&&ab!=lastAlloc&&!(mbi.Protect&PAGE_GUARD)&&!(mbi.Protect&PAGE_NOACCESS)){lastAlloc=ab;U16 mz=R16(ab);if(mz==0x5A4D){if(LooksLikeHotSpotImage(ab)){g_bridge.heuristicStructs=0;g_bridge.jvmSpan=RemoteImageSize(ab);return ab;}U64 sz=RemoteImageSize(ab);if(sz>=0x200000&&sz<=0x08000000&&HasHotSpotMarkers(ab)){g_bridge.heuristicStructs=1;g_bridge.jvmSpan=sz;return ab;}}else{BOOL ex=FALSE;U64 span=AllocationSpan(ab,&ex);if(ex&&span>=0x200000&&span<=0x08000000&&HasHotSpotMarkersRange(ab,span)){g_bridge.heuristicStructs=1;g_bridge.jvmSpan=span;return ab;}}allocs++;if((allocs&15)==15)Sleep(0);}
+        U64 next=(U64)(ULONG_PTR)mbi.BaseAddress+(U64)mbi.RegionSize;if(next<=addr)break;addr=next;}
+    return 0;
+}
+static U64 RemoteExport(const char* wanted){return RemoteExportAt(g_bridge.jvmBase,wanted);}
+struct VMNeed { const char* type; const char* field; int* offOut; U64* addrOut; };
+static BOOL ParseVMStructsExported(){
+    U64 pTable=RemoteExport("gHotSpotVMStructs"),pStride=RemoteExport("gHotSpotVMStructEntryArrayStride"),pType=RemoteExport("gHotSpotVMStructEntryTypeNameOffset"),pField=RemoteExport("gHotSpotVMStructEntryFieldNameOffset"),pStatic=RemoteExport("gHotSpotVMStructEntryIsStaticOffset"),pOff=RemoteExport("gHotSpotVMStructEntryOffsetOffset"),pAddr=RemoteExport("gHotSpotVMStructEntryAddressOffset");
+    if(!pTable||!pStride||!pType||!pField||!pStatic||!pOff||!pAddr)return FALSE;
+    U64 table=R64(pTable),stride=R64(pStride),to=R64(pType),fo=R64(pField),so=R64(pStatic),oo=R64(pOff),ao=R64(pAddr);if(!table||stride<24||stride>256)return FALSE;
+    ResetVMStructOffsets();
+    VMNeed needs[]={
+      {"ClassLoaderDataGraph","_head",0,&g_bridge.cldHeadAddr},{"ClassLoaderData","_next",&g_bridge.cldNext,0},{"ClassLoaderData","_klasses",&g_bridge.cldKlasses,0},
+      {"Klass","_name",&g_bridge.klassName,0},{"Klass","_next_link",&g_bridge.klassNext,0},{"Klass","_super",&g_bridge.klassSuper,0},{"Klass","_java_mirror",&g_bridge.klassJavaMirror,0},{"Klass","_layout_helper",&g_bridge.klassLayout,0},
+      {"oopDesc","_metadata._klass",&g_bridge.oopKlass,0},{"oopDesc","_metadata._compressed_klass",&g_bridge.oopCompressedKlass,0},
+      {"InstanceKlass","_fields",&g_bridge.ikFields,0},{"InstanceKlass","_fieldinfo_stream",&g_bridge.ikFieldInfoStream,0},{"InstanceKlass","_constants",&g_bridge.ikConstants,0},{"Symbol","_length",&g_bridge.symLength,0},{"Symbol","_body",&g_bridge.symBody,0},
+      {"CompressedOops","_narrow_oop._base",0,&g_bridge.coopsBaseAddr},{"CompressedOops","_narrow_oop._shift",0,&g_bridge.coopsShiftAddr},
+      {"CompressedKlassPointers","_narrow_klass._base",0,&g_bridge.cklassBaseAddr},{"CompressedKlassPointers","_narrow_klass._shift",0,&g_bridge.cklassShiftAddr},
+      {"CompressedOops","_base",0,&g_bridge.coopsBaseAddr},{"CompressedOops","_shift",0,&g_bridge.coopsShiftAddr},{"CompressedKlassPointers","_base",0,&g_bridge.cklassBaseAddr},{"CompressedKlassPointers","_shift",0,&g_bridge.cklassShiftAddr}
+    };
+    int count=(int)(sizeof(needs)/sizeof(needs[0]));char tn[96],fn[96];
+    for(U64 e=table,guard=0;guard<12000;guard++,e+=stride){U64 tp=R64(e+to);if(!tp)break;U64 fp=R64(e+fo);if(!fp)continue;if(!RStr(tp,tn,96)||!RStr(fp,fn,96))continue;int isStatic=(int)R32(e+so);
+      for(int i=0;i<count;i++)if(AEq(tn,needs[i].type)&&AEq(fn,needs[i].field)){if(isStatic&&needs[i].addrOut)*needs[i].addrOut=R64(e+ao);else if(!isStatic&&needs[i].offOut)*needs[i].offOut=(int)R64(e+oo);}
+    }
+    U64 pTypes=RemoteExport("gHotSpotVMTypes"),pTS=RemoteExport("gHotSpotVMTypeEntryArrayStride"),pTN=RemoteExport("gHotSpotVMTypeEntryTypeNameOffset"),pSZ=RemoteExport("gHotSpotVMTypeEntrySizeOffset");g_bridge.cpSize=0;
+    if(pTypes&&pTS&&pTN&&pSZ){U64 t=R64(pTypes),st=R64(pTS),no=R64(pTN),sz=R64(pSZ);char n[96];for(U64 e=t,g=0;e&&g<6000;g++,e+=st){U64 np=R64(e+no);if(!np)break;if(RStr(np,n,96)&&AEq(n,"ConstantPool")){g_bridge.cpSize=(int)R64(e+sz);break;}}}
+    if(g_bridge.coopsBaseAddr)g_bridge.coopsBase=R64(g_bridge.coopsBaseAddr);if(g_bridge.coopsShiftAddr)g_bridge.coopsShift=(int)R32(g_bridge.coopsShiftAddr);else g_bridge.coopsShift=3;
+    if(g_bridge.cklassBaseAddr)g_bridge.cklassBase=R64(g_bridge.cklassBaseAddr);if(g_bridge.cklassShiftAddr)g_bridge.cklassShift=(int)R32(g_bridge.cklassShiftAddr);else g_bridge.cklassShift=3;
+    if(g_bridge.cpSize<=0)g_bridge.cpSize=64;
+    return g_bridge.cldHeadAddr&&g_bridge.cldNext>=0&&g_bridge.cldKlasses>=0&&g_bridge.klassName>=0&&g_bridge.klassNext>=0&&g_bridge.klassSuper>=0&&g_bridge.klassJavaMirror>=0&&(g_bridge.ikFields>=0||g_bridge.ikFieldInfoStream>=0)&&g_bridge.ikConstants>=0&&g_bridge.symLength>=0&&g_bridge.symBody>=0;
+}
+static BOOL ParseVMStructs(){g_bridge.heuristicStructs=0;if(ParseVMStructsExported())return TRUE;return ParseVMStructsHeuristic(g_bridge.jvmBase);}
+static BOOL ReadSymbol(U64 sym,char* out,int cap){if(!sym||cap<2)return FALSE;U16 len=R16(sym+g_bridge.symLength);if(!len||len>4095)return FALSE;int n=(len<cap-1)?len:cap-1;if(!RMem(sym+g_bridge.symBody,out,n))return FALSE;out[n]=0;return TRUE;}
+static BOOL KlassName(U64 k,char*out,int cap){if(!k)return FALSE;U64 sp=R64(k+g_bridge.klassName);return ReadSymbol(sp,out,cap);}
+static U64 ResolveKlass(U64 oop){if(!oop)return 0;char n[96];if(g_bridge.oopCompressedKlass>=0){U32 nk=R32(oop+(U64)g_bridge.oopCompressedKlass);if(nk){U64 k=g_bridge.cklassBase+((U64)nk<<g_bridge.cklassShift);if(k&&KlassName(k,n,96))return k;}}if(g_bridge.oopKlass>=0){U64 k=R64(oop+(U64)g_bridge.oopKlass);if(k&&KlassName(k,n,96))return k;}U32 nk=R32(oop+8);if(nk){U64 k=g_bridge.cklassBase+((U64)nk<<g_bridge.cklassShift);if(k&&KlassName(k,n,96))return k;}U64 k=R64(oop+8);if(k&&KlassName(k,n,96))return k;return 0;}
+static U64 DecodeOop32(U32 n){return n?g_bridge.coopsBase+((U64)n<<g_bridge.coopsShift):0;}
+static U64 ReadOopAt(U64 a){U32 n=R32(a);if(n){U64 o=DecodeOop32(n);if(ResolveKlass(o))return o;}U64 o=R64(a);if(o&&ResolveKlass(o))return o;return 0;}
+static BOOL ReadOopAtChecked(U64 a,U64*out){if(!out||!a)return FALSE;*out=0;U32 n=0;if(!RMem(a,&n,sizeof(n)))return FALSE;if(n==0)return TRUE;U64 o=DecodeOop32(n);if(o&&ResolveKlass(o)){*out=o;return TRUE;}U64 full=0;if(!RMem(a,&full,sizeof(full)))return FALSE;if(full==0)return TRUE;if(ResolveKlass(full)){*out=full;return TRUE;}return FALSE;}
+static BOOL MatchAny(const char*s,const char*const* a,int n){for(int i=0;i<n;i++)if(AEq(s,a[i]))return TRUE;return FALSE;}
+struct WantedClass { const char*const* aliases; int aliasCount; U64* out; };
+static BOOL FindClassesBatch(WantedClass* wants,int wantCount){
+    if(!wants||wantCount<=0)return FALSE;for(int i=0;i<wantCount;i++)if(wants[i].out)*wants[i].out=0;
+    U64 cld=R64(g_bridge.cldHeadAddr);char n[180];int unresolved=wantCount,cc=0;
+    for(int cg=0;cld&&cg<10000&&unresolved>0;cg++,cld=R64(cld+g_bridge.cldNext)){U64 k=R64(cld+g_bridge.cldKlasses);for(int kg=0;k&&kg<120000&&unresolved>0;kg++,k=R64(k+g_bridge.klassNext)){
