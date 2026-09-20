@@ -750,3 +750,57 @@ struct HostRank {DWORD pid;U64 delta;int score;};
 static void AddRankedHost(HostRank* a,int* n,int cap,DWORD pid,U64 rootCreate,int bonus){if(!a||!n||!pid||*n>=cap)return;for(int i=0;i<*n;i++)if(a[i].pid==pid)return;U64 ct=GetProcCreateTimeValue(pid);if(!ct)return;U64 d=AbsDiff64(ct,rootCreate);int score=bonus;if(d<=120ULL*10000000ULL)score+=800-(int)(d/(1500000ULL));a[*n].pid=pid;a[*n].delta=d;a[*n].score=score;(*n)++;}
 static void SortHosts(HostRank* a,int n){for(int i=1;i<n;i++){HostRank v=a[i];int j=i-1;while(j>=0&&a[j].score<v.score){a[j+1]=a[j];j--;}a[j+1]=v;}}
 static __declspec(noinline) int BuildBridgeHostList(DWORD root,DWORD* out,int cap){
+
+    if(!out||cap<=0)return 0;int n=0;U64 rootCreate=GetProcCreateTimeValue(root);n=AddUniquePid(out,n,cap,root);
+    int ec=SnapshotProcEdges(g_procEdges,2048);HostRank ranked[96];int rn=0;
+    if(ec>0){DWORD cur=root;for(int depth=0;depth<4;depth++){DWORD parent=0;for(int i=0;i<ec;i++)if(g_procEdges[i].pid==cur){parent=g_procEdges[i].ppid;break;}if(!parent||parent==4)break;if(!BridgeHostNameBad(parent))AddRankedHost(ranked,&rn,96,parent,rootCreate,BridgeHostNameLikely(parent)?1200:500);cur=parent;}
+        DWORD frontier[64];int fn=1;frontier[0]=root;for(int depth=0;depth<4&&fn>0;depth++){DWORD next[64];int nn=0;for(int i=0;i<ec;i++){BOOL child=FALSE;for(int j=0;j<fn;j++)if(g_procEdges[i].ppid==frontier[j]){child=TRUE;break;}if(!child)continue;if(nn<64)next[nn++]=g_procEdges[i].pid;if(!BridgeHostNameBad(g_procEdges[i].pid))AddRankedHost(ranked,&rn,96,g_procEdges[i].pid,rootCreate,BridgeHostNameLikely(g_procEdges[i].pid)?1500:650);}fn=nn;for(int i=0;i<fn;i++)frontier[i]=next[i];}}
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
+    if(snap!=INVALID_HANDLE_VALUE){PROCESSENTRY32W pe;memset(&pe,0,sizeof(pe));pe.dwSize=sizeof(pe);if(Process32FirstW(snap,&pe))do{if(!pe.th32ProcessID||pe.th32ProcessID==4||pe.th32ProcessID==GetCurrentProcessId()||pe.th32ProcessID==root)continue;BOOL java=WEqualI(pe.szExeFile,L"java.exe")||WEqualI(pe.szExeFile,L"javaw.exe");BOOL known=WContainsI(pe.szExeFile,L"minecraft")||WContainsI(pe.szExeFile,L"lunar")||WContainsI(pe.szExeFile,L"badlion")||WContainsI(pe.szExeFile,L"feather")||WContainsI(pe.szExeFile,L"pulse");if(java||known)AddRankedHost(ranked,&rn,96,pe.th32ProcessID,rootCreate,java?1100:500);}while(Process32NextW(snap,&pe));CloseHandle(snap);}
+    SortHosts(ranked,rn);for(int i=0;i<rn&&n<cap;i++)n=AddUniquePid(out,n,cap,ranked[i].pid);return n;
+}
+static BOOL IsJvmNamedModule(const wchar_t* n,const wchar_t* p){return WEqualI(n,L"jvm.dll")||WContainsI(n,L"hotspot")||WContainsI(n,L"jvm")||AEndsI(p,L"\jvm.dll")||WContainsI(p,L"\server\jvm");}
+static int BuildGlobalJvmModuleHosts(DWORD root,DWORD* out,int cap){
+    if(!out||cap<=0)return 0;U64 rc=GetProcCreateTimeValue(root);HostRank ranked[64];int rn=0;HANDLE ps=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);if(ps==INVALID_HANDLE_VALUE)return 0;PROCESSENTRY32W pe;memset(&pe,0,sizeof(pe));pe.dwSize=sizeof(pe);
+    if(Process32FirstW(ps,&pe))do{DWORD pid=pe.th32ProcessID;if(!pid||pid==4||pid==GetCurrentProcessId()||pid==root||BridgeHostNameBad(pid))continue;HANDLE ms=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);if(ms==INVALID_HANDLE_VALUE)continue;MODULEENTRY32W me;memset(&me,0,sizeof(me));me.dwSize=sizeof(me);BOOL hit=FALSE;if(Module32FirstW(ms,&me))do{if(IsJvmNamedModule(me.szModule,me.szExePath)){hit=TRUE;break;}}while(Module32NextW(ms,&me));CloseHandle(ms);if(hit)AddRankedHost(ranked,&rn,64,pid,rc,1800);}while(Process32NextW(ps,&pe));CloseHandle(ps);SortHosts(ranked,rn);int n=0;for(int i=0;i<rn&&n<cap;i++)n=AddUniquePid(out,n,cap,ranked[i].pid);return n;
+}
+static ULONGLONG g_bridgeRetryAt=0; static volatile LONG g_bridgeAttachBusy=0; static DWORD g_attachPid=0; static ULONGLONG g_attachCreate=0;
+static DWORD g_bridgeAttemptPid=0; static ULONGLONG g_bridgeAttemptCreate=0; static int g_bridgeAttemptCount=0;
+static void ResetBridgeAttempts(){g_bridgeRetryAt=0;g_bridgeAttemptPid=g_bridgePidHint;g_bridgeAttemptCreate=g_bridgeCreateHint;g_bridgeAttemptCount=0;}
+static void BridgeClose(){if(g_bridge.process)CloseHandle(g_bridge.process);memset(&g_bridge,0,sizeof(g_bridge));GameSnapshot z={};PublishGameSnapshot(z);memset(g_targetKindCache,0,sizeof(g_targetKindCache));g_targetKindCacheNext=0;}
+static int BridgeTryHost(DWORD targetPid,U64 targetCreate,DWORD hostPid,char* failOut,int failCap){
+    BridgeClose();g_bridge.state=BR_ATTACHING;g_bridge.pid=targetPid;g_bridge.createTime=targetCreate;g_bridge.hostPid=hostPid;g_bridge.hostCreateTime=GetProcCreateTimeValue(hostPid);g_diagHostsTried++;
+    wchar_t hp[520];hp[0]=0;GetProcessPathStrict(hostPid,hp,520);g_diagHostPid=hostPid;WCopy(g_diagHostName,BaseNamePtr(hp),260);
+    ACopy(g_bridge.status,"opening candidate JVM host",128);g_bridge.process=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,hostPid);if(!g_bridge.process)g_bridge.process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_VM_READ,FALSE,hostPid);
+    if(!g_bridge.process){ACopy(g_bridge.status,"cannot open JVM host process for read",128);if(failOut)ACopy(failOut,g_bridge.status,failCap);return 1;}
+    ACopy(g_bridge.status,"read-only JVM/HotSpot probe",128);g_bridge.jvmBase=FindJvmBase(hostPid);
+    if(!g_bridge.jvmBase){ACopy(g_bridge.status,"JVM/HotSpot image or embedded VMStructs not found",128);if(failOut)ACopy(failOut,g_bridge.status,failCap);return 2;}
+    ACopy(g_bridge.status,g_bridge.heuristicStructs?"embedded HotSpot markers found - recovering VMStructs":"HotSpot found - parsing VMStructs",128);if(!ParseVMStructs()){ACopy(g_bridge.status,"HotSpot candidate found, VMStruct recovery failed",128);if(failOut)ACopy(failOut,g_bridge.status,failCap);return 3;}
+    g_bridge.structsParsed=1;ACopy(g_bridge.status,g_bridge.heuristicStructs?"exportless VMStructs recovered - resolving 1.21.11":(g_bridge.ikFieldInfoStream>=0?"JDK21 fieldinfo stream ready - resolving 1.21.11":"legacy field table ready - resolving 1.21.11"),128);
+    if(!CacheGameFields()){ACopy(g_bridge.status,"JVM ready, 1.21.11 mapping resolve failed",128);if(failOut)ACopy(failOut,g_bridge.status,failCap);return 4;}
+    g_bridge.state=BR_READY;ACopy(g_bridge.status,g_bridge.heuristicStructs?"Minecraft bridge ready (embedded HotSpot)":"Minecraft bridge ready",128);return 5;
+}
+static BOOL TryHostSet(DWORD targetPid,U64 targetCreate,const DWORD* hosts,int hc,char* bestFail,int failCap,int* bestRank,DWORD* bestHost){for(int i=0;i<hc;i++){char f[128];f[0]=0;int rank=BridgeTryHost(targetPid,targetCreate,hosts[i],f,128);if(rank==5)return TRUE;if(rank>*bestRank){*bestRank=rank;*bestHost=hosts[i];if(f[0])ACopy(bestFail,f,failCap);}}return FALSE;}
+static BOOL BridgeAttachPid(DWORD pid){
+    U64 targetCreate=GetProcCreateTimeValue(pid);if(!targetCreate){BridgeClose();g_bridge.state=BR_UNSUPPORTED;ACopy(g_bridge.status,"selected PID vanished before attach",128);return FALSE;}
+    g_diagHostsTried=0;g_diagHostPid=0;g_diagHostName[0]=0;g_diagFailRank=0;char bestFail[128];bestFail[0]=0;int bestRank=0;DWORD bestHost=0;
+    DWORD hosts[32];int hc=BuildBridgeHostList(pid,hosts,32);if(TryHostSet(pid,targetCreate,hosts,hc,bestFail,128,&bestRank,&bestHost))return TRUE;
+    DWORD deep[32];int dc=BuildGlobalJvmModuleHosts(pid,deep,32);if(TryHostSet(pid,targetCreate,deep,dc,bestFail,128,&bestRank,&bestHost))return TRUE;
+    BridgeClose();g_bridge.pid=pid;g_bridge.createTime=targetCreate;g_bridge.state=BR_UNSUPPORTED;g_diagFailRank=bestRank;g_diagHostPid=bestHost;if(bestHost){wchar_t hp[520];hp[0]=0;if(GetProcessPathStrict(bestHost,hp,520))WCopy(g_diagHostName,BaseNamePtr(hp),260);}
+    if(bestFail[0])ACopy(g_bridge.status,bestFail,128);else ACopy(g_bridge.status,"no readable Java/JVM host found for selected Minecraft session",128);return FALSE;
+}
+static DWORD WINAPI BridgeAttachWorker(LPVOID){
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_IDLE);
+    DWORD pid=g_attachPid;ULONGLONG expected=g_attachCreate;BOOL ok=BridgeAttachPid(pid);
+    if(pid!=g_bridgePidHint||expected!=g_bridgeCreateHint){BridgeClose();}
+    else if(ok){g_bridgeRetryAt=0;}
+    else{ULONGLONG now=GetTickCount64();if(g_bridgeAttemptCount<=1)g_bridgeRetryAt=now+5000;else if(g_bridgeAttemptCount==2)g_bridgeRetryAt=now+12000;else g_bridgeRetryAt=now+60000;}
+    g_bridgeAttachBusy=0;return 0;
+}
+static BOOL BridgeEnsure(){
+    if(g_bridge.state==BR_READY&&g_bridge.pid==g_bridgePidHint&&g_bridge.createTime==g_bridgeCreateHint&&g_bridgePidHint)return TRUE;
+    if(!g_bridgePidHint)return FALSE;if(g_bridgeAttemptPid!=g_bridgePidHint||g_bridgeAttemptCreate!=g_bridgeCreateHint)ResetBridgeAttempts();if(g_bridgeAttachBusy)return FALSE;
+    ULONGLONG now=GetTickCount64();if(now<g_bridgeRetryAt)return FALSE;g_attachPid=g_bridgePidHint;g_attachCreate=g_bridgeCreateHint;g_bridgeAttachBusy=1;g_bridgeAttemptCount++;
+    DWORD tid=0;HANDLE th=CreateThread(0,0,BridgeAttachWorker,0,0,&tid);if(!th){g_bridgeAttachBusy=0;g_bridgeRetryAt=now+30000;ACopy(g_bridge.status,"attach worker create failed",128);return FALSE;}CloseHandle(th);return FALSE;
+}
+static WeaponKind CurrentWeapon(U64 player){U64 st=ReadObjField(player,g_bridge.playerHeld);if(!st)return WPN_NONE;U64 item=ReadObjField(st,g_bridge.stackItem);if(!item)return WPN_NONE;U64 mace=ReadStaticOop(g_bridge.itemsKlass,g_bridge.maceItemField);if(mace&&item==mace)return WPN_MACE;for(int i=0;i<7;i++){U64 sword=ReadStaticOop(g_bridge.itemsKlass,g_bridge.swordItemFields[i]);if(sword&&item==sword)return WPN_SWORD;}
