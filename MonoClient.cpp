@@ -532,3 +532,102 @@ static BYTE g_hotspotScanBuf[262144];
 
 struct InvisibleInfo { U64 oop; double x,y,z; char name[64]; };
 struct GameSnapshot {
+
+    BOOL ready; U64 player,target,world; WeaponKind weapon; TargetKind targetKind;
+    BOOL onGround,touchWater,eyeWater,hasVehicle,sprinting,attackTickerKnown,criticalStateKnown; double fallDistance; int attackTicker;
+    int invisiblePlayers; char firstInvisible[64]; InvisibleInfo invis[16]; int invisCount;
+    double camX,camY,camZ; float camYaw,camPitch; BOOL cameraReady;
+};
+static GameSnapshot g_game={}; static GameSnapshot g_engineNext={};
+static ULONGLONG g_lastAttackTick=0; static int g_attackCount=0;
+static void PublishGameSnapshot(const GameSnapshot& src){memcpy(&g_game,&src,sizeof(src));}
+
+static BOOL RMem(U64 addr,void* out,SIZE_T n){ if(!g_bridge.process||!addr)return FALSE; SIZE_T got=0; return ReadProcessMemory(g_bridge.process,(LPCVOID)(ULONG_PTR)addr,out,n,&got)&&got==n; }
+static U8 R8(U64 a){U8 v=0;RMem(a,&v,1);return v;} static U16 R16(U64 a){U16 v=0;RMem(a,&v,2);return v;}
+static U32 R32(U64 a){U32 v=0;RMem(a,&v,4);return v;} static U64 R64(U64 a){U64 v=0;RMem(a,&v,8);return v;}
+static BOOL RStr(U64 a,char* out,int cap){if(!out||cap<2){return FALSE;}out[0]=0;if(!a)return FALSE;for(int i=0;i<cap-1;i++){char c=0;if(!RMem(a+i,&c,1))return FALSE;out[i]=c;if(!c)return TRUE;}out[cap-1]=0;return TRUE;}
+
+static U64 RemoteExportAt(U64 b,const char* wanted){
+    if(!b)return 0;U16 mz=R16(b);if(mz!=0x5A4D)return 0;U32 peoff=R32(b+0x3c);if(peoff<64||peoff>0x4000||R32(b+peoff)!=0x00004550)return 0;
+    U64 opt=b+peoff+24;U16 magic=R16(opt);if(magic!=0x20b&&magic!=0x10b)return 0;U32 expRva=R32(opt+(magic==0x20b?112:96));if(!expRva)return 0;U64 ed=b+expRva;
+    U32 funcs=R32(ed+28),names=R32(ed+32),ords=R32(ed+36),n=R32(ed+24);if(!funcs||!names||!ords||n==0||n>20000)return 0;
+    char nm[128];for(U32 i=0;i<n;i++){U32 nr=R32(b+names+i*4ULL);if(!nr)continue;if(!RStr(b+nr,nm,128))continue;if(AEq(nm,wanted)){U16 ord=R16(b+ords+i*2ULL);U32 fr=R32(b+funcs+ord*4ULL);return fr?b+fr:0;}}
+    return 0;
+}
+static BOOL LooksLikeHotSpotImage(U64 base){
+    if(!base)return FALSE;
+    return RemoteExportAt(base,"gHotSpotVMStructs") &&
+           RemoteExportAt(base,"gHotSpotVMStructEntryArrayStride") &&
+           RemoteExportAt(base,"gHotSpotVMTypes");
+}
+static U64 RemoteImageSize(U64 b){
+    if(!b||R16(b)!=0x5A4D)return 0;U32 peoff=R32(b+0x3c);if(peoff<64||peoff>0x4000||R32(b+peoff)!=0x00004550)return 0;
+    U64 opt=b+peoff+24;U16 magic=R16(opt);if(magic!=0x20b&&magic!=0x10b)return 0;U32 sz=R32(opt+56);if(sz<0x10000||sz>0x40000000)return 0;return (U64)sz;
+}
+static BOOL MemReadable(const MEMORY_BASIC_INFORMATION_X64& m){return m.State==MEM_COMMIT && !(m.Protect&PAGE_GUARD) && !(m.Protect&PAGE_NOACCESS);}
+static int LocalFindBytes(const BYTE* b,int n,const char* needle,int nl,int* out,int cap){
+    if(!b||!needle||nl<=0||n<nl||!out||cap<=0)return 0;int c=0;for(int i=0;i<=n-nl&&c<cap;i++){int j=0;for(;j<nl;j++)if(b[i+j]!=(BYTE)needle[j])break;if(j==nl)out[c++]=i;}return c;
+}
+static int ImageFindAscii(U64 base,U64 size,const char* needle,U64* out,int cap){
+    if(!base||!size||!needle||!out||cap<=0)return 0;int nl=0;while(needle[nl]&&nl<120)nl++;if(nl<=0)return 0;int found=0;U64 end=base+size,addr=base;MEMORY_BASIC_INFORMATION_X64 mbi;
+    while(addr<end&&found<cap){SIZE_T q=VirtualQueryEx(g_bridge.process,(LPCVOID)(ULONG_PTR)addr,&mbi,sizeof(mbi));if(q!=sizeof(mbi))break;U64 rb=(U64)(ULONG_PTR)mbi.BaseAddress,re=rb+(U64)mbi.RegionSize;if(re>base&&rb<end&&MemReadable(mbi)){
+        U64 st=rb<base?base:rb,lim=re>end?end:re;for(U64 p=st;p<lim&&found<cap;){SIZE_T want=(SIZE_T)((lim-p)>sizeof(g_hotspotScanBuf)?sizeof(g_hotspotScanBuf):(lim-p));SIZE_T got=0;if(ReadProcessMemory(g_bridge.process,(LPCVOID)(ULONG_PTR)p,g_hotspotScanBuf,want,&got)&&got>=(SIZE_T)nl){int offs[16];int nn=LocalFindBytes(g_hotspotScanBuf,(int)got,needle,nl,offs,16);for(int i=0;i<nn&&found<cap;i++)out[found++]=p+(U64)offs[i];}if(want<=128)break;U64 step=(U64)want-(U64)(nl>1?nl-1:0);if(!step)break;p+=step;}}
+        if(re<=addr)break;addr=re;
+    }return found;
+}
+static int ImageFindU64(U64 base,U64 size,U64 value,U64* out,int cap){
+    if(!base||!size||!value||!out||cap<=0)return 0;int found=0;U64 end=base+size,addr=base;MEMORY_BASIC_INFORMATION_X64 mbi;
+    while(addr<end&&found<cap){SIZE_T q=VirtualQueryEx(g_bridge.process,(LPCVOID)(ULONG_PTR)addr,&mbi,sizeof(mbi));if(q!=sizeof(mbi))break;U64 rb=(U64)(ULONG_PTR)mbi.BaseAddress,re=rb+(U64)mbi.RegionSize;if(re>base&&rb<end&&MemReadable(mbi)){
+        U64 st=rb<base?base:rb,lim=re>end?end:re;for(U64 p=st;p<lim&&found<cap;){SIZE_T want=(SIZE_T)((lim-p)>sizeof(g_hotspotScanBuf)?sizeof(g_hotspotScanBuf):(lim-p));SIZE_T got=0;if(ReadProcessMemory(g_bridge.process,(LPCVOID)(ULONG_PTR)p,g_hotspotScanBuf,want,&got)&&got>=8){for(SIZE_T i=0;i+8<=got;i+=8){U64 v=0;memcpy(&v,g_hotspotScanBuf+i,8);if(v==value&&found<cap)out[found++]=p+(U64)i;}}if(want<=8)break;U64 step=(U64)want-8;if(!step)break;p+=step;}}
+        if(re<=addr)break;addr=re;
+    }return found;
+}
+static BOOL FastRemoteString(U64 a,char* out,int cap){
+    if(!a||!out||cap<2)return FALSE;out[0]=0;SIZE_T got=0;int want=cap-1;if(want>127)want=127;BYTE tmp[128];if(!ReadProcessMemory(g_bridge.process,(LPCVOID)(ULONG_PTR)a,tmp,(SIZE_T)want,&got)||got==0)return FALSE;int n=0;for(;n<(int)got&&n<cap-1;n++){char c=(char)tmp[n];out[n]=c;if(!c)return n>0;}out[n]=0;return n>0;
+}
+static BOOL PlausibleVMStructEntry(U64 e,U64 base,U64 size){
+    BYTE b[48];if(!RMem(e,b,sizeof(b)))return FALSE;U64 tp=0,fp=0;U32 st=0;memcpy(&tp,b,8);memcpy(&fp,b+8,8);memcpy(&st,b+24,4);if(!tp||!fp||st>1)return FALSE;if(tp<base||tp>=base+size||fp<base||fp>=base+size)return FALSE;char t[80],f[80];if(!FastRemoteString(tp,t,80)||!FastRemoteString(fp,f,80))return FALSE;return t[0]&&f[0];
+}
+static U64 FindVMStructAnchor(U64 base,U64 size){
+    U64 ta[8],fa[16];int tn=ImageFindAscii(base,size,"ClassLoaderDataGraph",ta,8),fn=ImageFindAscii(base,size,"_head",fa,16);if(!tn||!fn)return 0;
+    for(int ti=0;ti<tn;ti++){U64 refs[64];int rn=ImageFindU64(base,size,ta[ti],refs,64);for(int r=0;r<rn;r++){BYTE b[48];if(!RMem(refs[r],b,sizeof(b)))continue;U64 fp=0;U32 st=0;U64 addr=0;memcpy(&fp,b+8,8);memcpy(&st,b+24,4);memcpy(&addr,b+40,8);BOOL fm=FALSE;for(int fi=0;fi<fn;fi++)if(fp==fa[fi]){fm=TRUE;break;}if(fm&&st==1&&addr&&PlausibleVMStructEntry(refs[r],base,size))return refs[r];}}
+    return 0;
+}
+static BOOL HasHotSpotMarkersRange(U64 base,U64 size){if(!base||size<0x10000||size>0x40000000)return FALSE;U64 a[2],b[2],c[2];return ImageFindAscii(base,size,"ClassLoaderDataGraph",a,2)>0&&ImageFindAscii(base,size,"_fieldinfo_stream",b,2)>0&&ImageFindAscii(base,size,"CompressedOops",c,2)>0;}
+static BOOL HasHotSpotMarkers(U64 base){U64 size=RemoteImageSize(base);return size?HasHotSpotMarkersRange(base,size):FALSE;}
+static U64 AllocationSpan(U64 base,BOOL*hasExec){
+    if(hasExec)*hasExec=FALSE;if(!base)return 0;U64 p=base,end=base;MEMORY_BASIC_INFORMATION_X64 m;for(int g=0;g<8192;g++){SIZE_T q=VirtualQueryEx(g_bridge.process,(LPCVOID)(ULONG_PTR)p,&m,sizeof(m));if(q!=sizeof(m)||(U64)(ULONG_PTR)m.AllocationBase!=base)break;U64 re=(U64)(ULONG_PTR)m.BaseAddress+(U64)m.RegionSize;if(MemReadable(m)&&(m.Protect&(PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))&&hasExec)*hasExec=TRUE;if(re>end)end=re;if(re<=p)break;p=re;}return end>base?end-base:0;
+}
+static int HeuristicConstantPoolSize(U64 base,U64 size){
+    U64 ss[8];int sn=ImageFindAscii(base,size,"ConstantPool",ss,8);for(int si=0;si<sn;si++){U64 refs[64];int rn=ImageFindU64(base,size,ss[si],refs,64);for(int i=0;i<rn;i++){BYTE b[40];if(!RMem(refs[i],b,sizeof(b)))continue;U64 tp=0,sp=0,sz=0;U32 a=0,c=0,d=0;memcpy(&tp,b,8);memcpy(&sp,b+8,8);memcpy(&a,b+16,4);memcpy(&c,b+20,4);memcpy(&d,b+24,4);memcpy(&sz,b+32,8);if(tp==ss[si]&&(sp==0||(sp>=base&&sp<base+size))&&a<=1&&c<=1&&d<=1&&sz>=32&&sz<=512&&(sz%8)==0)return (int)sz;}}return 64;
+}
+static void ResetVMStructOffsets(){
+    g_bridge.cldHeadAddr=0;g_bridge.cldNext=g_bridge.cldKlasses=g_bridge.klassName=g_bridge.klassNext=g_bridge.klassSuper=g_bridge.klassJavaMirror=g_bridge.klassLayout=-1;g_bridge.oopKlass=g_bridge.oopCompressedKlass=-1;
+    g_bridge.ikFields=g_bridge.ikFieldInfoStream=g_bridge.ikConstants=g_bridge.symLength=g_bridge.symBody=-1;g_bridge.cpSize=0;g_bridge.coopsBaseAddr=g_bridge.coopsShiftAddr=g_bridge.cklassBaseAddr=g_bridge.cklassShiftAddr=0;g_bridge.coopsBase=g_bridge.cklassBase=0;g_bridge.coopsShift=g_bridge.cklassShift=3;
+}
+static BOOL ParseVMStructsHeuristic(U64 base){
+    U64 size=g_bridge.jvmSpan?g_bridge.jvmSpan:RemoteImageSize(base);if(!size)return FALSE;U64 anchor=FindVMStructAnchor(base,size);if(!anchor)return FALSE;ResetVMStructOffsets();
+    struct HNeed{const char*t;const char*f;int*o;U64*a;};HNeed n[]={
+      {"ClassLoaderDataGraph","_head",0,&g_bridge.cldHeadAddr},{"ClassLoaderData","_next",&g_bridge.cldNext,0},{"ClassLoaderData","_klasses",&g_bridge.cldKlasses,0},
+      {"Klass","_name",&g_bridge.klassName,0},{"Klass","_next_link",&g_bridge.klassNext,0},{"Klass","_super",&g_bridge.klassSuper,0},{"Klass","_java_mirror",&g_bridge.klassJavaMirror,0},{"Klass","_layout_helper",&g_bridge.klassLayout,0},
+      {"oopDesc","_metadata._klass",&g_bridge.oopKlass,0},{"oopDesc","_metadata._compressed_klass",&g_bridge.oopCompressedKlass,0},
+      {"InstanceKlass","_fields",&g_bridge.ikFields,0},{"InstanceKlass","_fieldinfo_stream",&g_bridge.ikFieldInfoStream,0},{"InstanceKlass","_constants",&g_bridge.ikConstants,0},{"Symbol","_length",&g_bridge.symLength,0},{"Symbol","_body",&g_bridge.symBody,0},
+      {"CompressedOops","_narrow_oop._base",0,&g_bridge.coopsBaseAddr},{"CompressedOops","_narrow_oop._shift",0,&g_bridge.coopsShiftAddr},{"CompressedOops","_base",0,&g_bridge.coopsBaseAddr},{"CompressedOops","_shift",0,&g_bridge.coopsShiftAddr},
+      {"CompressedKlassPointers","_narrow_klass._base",0,&g_bridge.cklassBaseAddr},{"CompressedKlassPointers","_narrow_klass._shift",0,&g_bridge.cklassShiftAddr},{"CompressedKlassPointers","_base",0,&g_bridge.cklassBaseAddr},{"CompressedKlassPointers","_shift",0,&g_bridge.cklassShiftAddr}
+    };int nc=(int)(sizeof(n)/sizeof(n[0]));U64 start=anchor;for(int i=0;i<4096;i++){if(start<base+48)break;U64 p=start-48;if(!PlausibleVMStructEntry(p,base,size))break;start=p;}
+    char t[96],f[96];int matched=0;for(U64 e=start,g=0;g<12000&&e+48<=base+size;g++,e+=48){BYTE b[48];if(!RMem(e,b,sizeof(b)))break;U64 tp=0,fp=0,off=0,addr=0;U32 st=0;memcpy(&tp,b,8);memcpy(&fp,b+8,8);memcpy(&st,b+24,4);memcpy(&off,b+32,8);memcpy(&addr,b+40,8);if(!tp||!fp)break;if(tp<base||tp>=base+size||fp<base||fp>=base+size)break;if(!FastRemoteString(tp,t,96)||!FastRemoteString(fp,f,96))break;for(int i=0;i<nc;i++)if(AEq(t,n[i].t)&&AEq(f,n[i].f)){if(st&&n[i].a&&!*n[i].a){*n[i].a=addr;matched++;}else if(!st&&n[i].o&&*n[i].o<0){*n[i].o=(int)off;matched++;}}}
+    g_bridge.cpSize=HeuristicConstantPoolSize(base,size);if(g_bridge.coopsBaseAddr)g_bridge.coopsBase=R64(g_bridge.coopsBaseAddr);if(g_bridge.coopsShiftAddr)g_bridge.coopsShift=(int)R32(g_bridge.coopsShiftAddr);if(g_bridge.cklassBaseAddr)g_bridge.cklassBase=R64(g_bridge.cklassBaseAddr);if(g_bridge.cklassShiftAddr)g_bridge.cklassShift=(int)R32(g_bridge.cklassShiftAddr);
+    g_bridge.heuristicStructs=1;return matched>=10&&g_bridge.cldHeadAddr&&g_bridge.cldNext>=0&&g_bridge.cldKlasses>=0&&g_bridge.klassName>=0&&g_bridge.klassNext>=0&&g_bridge.klassSuper>=0&&g_bridge.klassJavaMirror>=0&&(g_bridge.ikFields>=0||g_bridge.ikFieldInfoStream>=0)&&g_bridge.ikConstants>=0&&g_bridge.symLength>=0&&g_bridge.symBody>=0;
+}
+static U64 FindJvmBase(DWORD pid){
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);
+    U64 moduleBases[1024];U8 moduleHints[1024];int moduleCount=0;BOOL sawJvmNamed=FALSE;
+    if(snap!=INVALID_HANDLE_VALUE){
+        MODULEENTRY32W me;memset(&me,0,sizeof(me));me.dwSize=sizeof(me);
+        if(Module32FirstW(snap,&me))do{
+            U64 mb=(U64)(ULONG_PTR)me.modBaseAddr;
+            BOOL jn=WEqualI(me.szModule,L"jvm.dll")||AEndsI(me.szExePath,L"\jvm.dll")||WContainsI(me.szModule,L"hotspot")||WContainsI(me.szModule,L"jvm");
+            BOOL hint=jn||WContainsI(me.szModule,L"pulse")||WContainsI(me.szModule,L"java");
+            if(moduleCount<1024){moduleBases[moduleCount]=mb;moduleHints[moduleCount]=(U8)(hint?1:0);moduleCount++;}
+            if(jn)sawJvmNamed=TRUE;
+            if(jn){
